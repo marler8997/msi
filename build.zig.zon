@@ -1,0 +1,23 @@
+.{
+    .name = .msi,
+    .fingerprint = 0x8f3272a87a30fe82,
+    .version = "0.0.1",
+    .zig_version = "0.15.2",
+    .minimum_zig_version = "0.14.1",
+    .dependencies = .{
+        .iobackport = .{
+            .url = "git+https://github.com/marler8997/zig-io-backport#1a65f3662c642a621481163af94f8733632b60bb",
+            .hash = "iobackport-0.0.0-KeWQeNuaAwAHiuzR9swwVpGuVf1KWGcCrVQGaIc4hcSk",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "cli",
+        "msi",
+        "stdfork",
+        "test",
+        "vers",
+    },
+}

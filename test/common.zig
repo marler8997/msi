@@ -73,6 +73,7 @@ pub const File = struct {
             defer scratch.free(cache_basename);
             const file_cache_path = try std.fs.path.join(scratch, &.{ cache_path, cache_basename });
             defer scratch.free(file_cache_path);
+
             try fetch(scratch, entry.uri, file_cache_path);
             const installer_path = try std.fs.path.join(scratch, &.{ scratch_path, "installer", basename });
             defer scratch.free(installer_path);
@@ -126,6 +127,13 @@ fn nextLine(it: *std.mem.SplitIterator(u8, .scalar), lineno: *u32) ?[]const u8 {
 }
 
 fn fetch(scratch: std.mem.Allocator, uri: []const u8, out: []const u8) !void {
+    if (std.fs.path.dirname(out)) |d| try std.fs.cwd().makePath(d);
+
+    const lock_path = try std.mem.concat(scratch, u8, &.{ out, ".lock" });
+    defer scratch.free(lock_path);
+    var lock = try LockFile.lock(lock_path);
+    defer lock.unlock();
+
     if (std.fs.cwd().access(out, .{})) {
         std.log.info("{s}: already fetched", .{out});
         return;
@@ -133,8 +141,6 @@ fn fetch(scratch: std.mem.Allocator, uri: []const u8, out: []const u8) !void {
         error.FileNotFound => {},
         else => |e| return e,
     }
-
-    if (std.fs.path.dirname(out)) |d| try std.fs.cwd().makePath(d);
 
     const encoded_uri = try uriEncode(scratch, uri);
     defer if (encoded_uri.ptr != uri.ptr) scratch.free(encoded_uri);
@@ -337,3 +343,4 @@ const File15 = if (zig15) std.fs.File else std15.fs.File15;
 
 const std = @import("std");
 const ArrayList = if (zig15) std.ArrayList else std.ArrayListUnmanaged;
+const LockFile = @import("LockFile.zig");

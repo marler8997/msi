@@ -1,0 +1,72 @@
+name: Artifacts
+on: [pull_request, workflow_dispatch]
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          # Windows builds
+          - os: windows-latest
+            arch: aarch64
+          - os: windows-latest
+            arch: x86
+          - os: windows-latest
+            arch: x86_64
+          # macOS builds
+          - os: macos-latest
+            arch: aarch64
+          - os: macos-latest
+            arch: x86_64
+          # Linux builds
+          - os: ubuntu-latest
+            arch: aarch64
+          - os: ubuntu-latest
+            arch: armv7a
+          - os: ubuntu-latest
+            arch: powerpc64le
+          - os: ubuntu-latest
+            arch: riscv64
+          - os: ubuntu-latest
+            arch: s390x
+          - os: ubuntu-latest
+            arch: x86
+          - os: ubuntu-latest
+            arch: x86_64
+      fail-fast: false
+    runs-on: ${{matrix.os}}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install anyzig
+        shell: bash
+        run: |
+          case "$(uname -m)" in
+            x86_64|amd64) ANYZIG_ARCH="x86_64" ;;
+            aarch64|arm64) ANYZIG_ARCH="aarch64" ;;
+            *) echo "Error: unsupported architecture '$(uname -m)'" >&2; exit 1 ;;
+          esac
+
+          case "$RUNNER_OS" in
+            Windows) ANYZIG_OS="windows"; EXT="zip" ;;
+            macOS)   ANYZIG_OS="macos";   EXT="tar.gz" ;;
+            Linux)   ANYZIG_OS="linux";   EXT="tar.gz" ;;
+            *) echo "Error: unsupported OS '$RUNNER_OS'" >&2; exit 1 ;;
+          esac
+
+          URL="https://github.com/marler8997/anyzig/releases/latest/download/anyzig-${ANYZIG_ARCH}-${ANYZIG_OS}.${EXT}"
+          echo "Downloading $URL"
+          mkdir -p "$HOME/anyzig"
+
+          if [[ "$EXT" == "zip" ]]; then
+            curl -fsSL -o anyzig.zip "$URL"
+            unzip -o anyzig.zip -d "$HOME/anyzig"
+          else
+            curl -fsSL "$URL" | tar -xz -C "$HOME/anyzig"
+          fi
+
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            cygpath -w "$HOME/anyzig" >> "$GITHUB_PATH"
+          else
+            echo "$HOME/anyzig" >> "$GITHUB_PATH"
+          fi
+      - run: zig build test --summary all
+      - run: zig 0.14.1 build test --summary all

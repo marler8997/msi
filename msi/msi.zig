@@ -9,17 +9,6 @@ pub fn install(scratch: std.mem.Allocator, opt: InstallOptions) !void {
     var cfb = try Cfb.parse(opt.msi_content);
     try cfb.loadStructures(scratch);
 
-    var cab_stream_index: ?usize = null;
-    for (cfb.dir_entries.?, 0..) |entry, i| {
-        if (entry.object_type == 0) continue;
-
-        if (entry.stream_size > 100000 and try entry.getObjectType() == .stream) {
-            if (cab_stream_index == null) {
-                cab_stream_index = i;
-            }
-        }
-    }
-
     var msi_db = try MsiDatabase.parse(&cfb, scratch);
     defer msi_db.deinit();
 
@@ -57,30 +46,25 @@ pub fn install(scratch: std.mem.Allocator, opt: InstallOptions) !void {
         }
     }
 
-    if (cab_stream_index) |cab_idx| {
-        const cab_entry = cfb.dir_entries.?[cab_idx];
-        log.info("trying embedded CAB from stream index {}...", .{cab_idx});
+    // Search all streams for an embedded CAB (MSCF signature)
+    for (cfb.dir_entries.?, 0..) |entry, i| {
+        if (entry.object_type == 0) continue;
+        if (entry.stream_size < 36 or try entry.getObjectType() != .stream) continue;
 
-        const cab_data = try cfb.readStream(cab_entry, scratch);
-        defer scratch.free(cab_data);
+        const stream_data = try cfb.readStream(entry, scratch);
+        defer scratch.free(stream_data);
 
-        // Verify it's a CAB file (signature: 'MSCF' = 0x4D534346)
-        if (cab_data.len >= 4) {
-            const sig = std.mem.readInt(u32, cab_data[0..4], .little);
-            if (sig == 0x4D534346) {
-                log.info("confirmed CAB file signature (MSCF), size={} bytes", .{cab_data.len});
-                try std.fs.cwd().makePath(opt.install_path);
-                try extractCab(cab_data, opt.install_path, scratch, &msi_db);
-                log.info("MSI installation complete", .{});
-            } else {
-                log.err("stream is not a CAB file (signature: 0x{X:0>8}, expected 0x4D534346)", .{sig});
-                return error.NotACabFile;
-            }
+        if (stream_data.len >= 4 and std.mem.eql(u8, stream_data[0..4], "MSCF")) {
+            log.info("found embedded CAB at stream index {}, size={} bytes", .{ i, stream_data.len });
+            try std.fs.cwd().makePath(opt.install_path);
+            try extractCab(stream_data, opt.install_path, scratch, &msi_db);
+            log.info("MSI installation complete", .{});
+            return;
         }
-    } else {
-        log.err("no CAB file found (neither external nor embedded)", .{});
-        return error.NoCabFound;
     }
+
+    log.info("no CAB file found, nothing to extract", .{});
+    try std.fs.cwd().makePath(opt.install_path);
 }
 
 const CabHeaderFlags = packed struct(u16) {
@@ -1046,8 +1030,7 @@ const MsiDatabase = struct {
         if (file_table_idx) |idx| {
             try db.parseFileTable(cfb, idx);
         } else {
-            log.err("MSI database missing required File table", .{});
-            return error.MissingFileTable;
+            log.debug("MSI database missing File table", .{});
         }
 
         if (directory_table_idx) |idx| {

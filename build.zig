@@ -80,6 +80,7 @@ pub fn build(b: *std.Build) void {
         "sdkheaders2",
         "sdkheaders3",
         "sdkheaders4",
+        "sdkheaders5",
         "sdkheadersx64",
         "sdkheadersx86",
         "sdklibsarm",

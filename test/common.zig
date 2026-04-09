@@ -146,7 +146,7 @@ fn fetch(scratch: std.mem.Allocator, uri: []const u8, out: []const u8) !void {
     defer if (encoded_uri.ptr != uri.ptr) scratch.free(encoded_uri);
 
     const argv = [_][]const u8{
-        "curl", "-L", "-o", out, encoded_uri,
+        "curl", "--fail", "-L", "-o", out, encoded_uri,
     };
     {
         var stderr_buf: [1000]u8 = undefined;

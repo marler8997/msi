@@ -364,28 +364,9 @@ fn decompressFolder(cab_data: []const u8, folder_index: u16, folders_offset: usi
                 if (compressed_data.len < 2) return error.InvalidMszipData;
                 if (compressed_data[0] != 'C' or compressed_data[1] != 'K') return error.InvalidMszipSignature;
 
-                // Each block is its own deflate stream, but its matches can reach back into
-                // the previous blocks, so it's decompressed right after them where they serve
-                // as its history.
-                var input: std.Io.Reader = .fixed(compressed_data[2..]);
-                var decompress: std.compress.flate.Decompress = .init(&input, .raw, &.{});
-                var output: std.Io.Writer = .fixed(result_buf);
-                output.end = result_pos;
-                // Only as much as the block says it has and not until the end of the deflate
-                // stream, a block doesn't have to end its stream.
-                decompress.reader.streamExact(&output, uncompressed_size) catch |err| switch (err) {
-                    error.ReadFailed => {
-                        log.err("decompressing CAB block {} failed with {t}", .{ block_num, decompress.err.? });
-                        return decompress.err.?;
-                    },
-                    error.EndOfStream => {
-                        log.err("CAB block {} decompressed to {} bytes but expected {}", .{ block_num, output.end - result_pos, uncompressed_size });
-                        return error.InvalidMszipData;
-                    },
-                    error.WriteFailed => {
-                        log.err("CAB block {} has {} bytes but only {} are left in its folder", .{ block_num, uncompressed_size, result_remaining });
-                        return error.InvalidMszipData;
-                    },
+                decompressMszipBlock(compressed_data[2..], result_buf, result_pos, uncompressed_size) catch |err| {
+                    log.err("decompressing CAB block {} to {} bytes failed with {t}", .{ block_num, uncompressed_size, err });
+                    return err;
                 };
                 result_pos += uncompressed_size;
             },
@@ -401,6 +382,47 @@ fn decompressFolder(cab_data: []const u8, folder_index: u16, folders_offset: usi
         return error.InvalidCabFile;
     }
     return result_buf;
+}
+
+/// Decompresses the deflate stream of an MSZIP block to `result_buf` at `result_pos`. Each block
+/// is its own deflate stream, but its matches can reach back into the previous blocks, which are
+/// what's before `result_pos` and serve as its history.
+fn decompressMszipBlock(deflate: []const u8, result_buf: []u8, result_pos: usize, uncompressed_size: u16) !void {
+    const history_len = std.compress.flate.history_len;
+    std.debug.assert(uncompressed_size <= result_buf.len - result_pos);
+
+    var input: std.Io.Reader = .fixed(deflate);
+    var decompress: std.compress.flate.Decompress = .init(&input, .raw, &.{});
+    var output: std.Io.Writer = .fixed(result_buf);
+    output.end = result_pos;
+    // Only as much as the block says it has and not until the end of the deflate stream, a
+    // block doesn't have to end its stream.
+    decompress.reader.streamExact(&output, uncompressed_size) catch |err| switch (err) {
+        error.ReadFailed => return decompress.err.?,
+        error.EndOfStream => return error.MszipBlockTooShort,
+        error.WriteFailed => unreachable, // there's room, see the assert
+    };
+
+    // The stream shouldn't have anything more in it. Finding out takes room for one more byte
+    // after the history, which the last block of a folder doesn't have.
+    var end_buf: [history_len + 1]u8 = undefined;
+    if (output.end == result_buf.len) {
+        const history = result_buf[result_buf.len -| history_len..];
+        @memcpy(end_buf[0..history.len], history);
+        output = .fixed(&end_buf);
+        output.end = history.len;
+    }
+    while (true) {
+        const more = decompress.reader.stream(&output, .limited(1)) catch |err| switch (err) {
+            error.EndOfStream => return,
+            error.ReadFailed => switch (decompress.err.?) {
+                error.EndOfStream => return, // the stream wasn't ended
+                else => |e| return e,
+            },
+            error.WriteFailed => unreachable, // there's room for one more
+        };
+        if (more != 0) return error.MszipBlockTooLong;
+    }
 }
 
 /// Makes a cab with only what `decompressFolder` reads, one folder and its data blocks.
@@ -450,6 +472,31 @@ test "mszip block with a match in the previous block" {
     const data = try decompressFolder(cab, 0, 0, std.testing.allocator);
     defer std.testing.allocator.free(data);
     try std.testing.expectEqualStrings("abcdefghabcdefgh", data);
+}
+
+test "mszip block with more than it says it has" {
+    // a stored block of 5 bytes
+    const deflate = [_]u8{ 1, 5, 0, 0xfa, 0xff } ++ "hello";
+    // with and without room after it in the folder
+    var buf: [8]u8 = undefined;
+    try std.testing.expectError(error.MszipBlockTooLong, decompressMszipBlock(deflate, &buf, 0, 3));
+    try std.testing.expectError(error.MszipBlockTooLong, decompressMszipBlock(deflate, buf[0..3], 0, 3));
+    try decompressMszipBlock(deflate, buf[0..5], 0, 5);
+    try std.testing.expectEqualStrings("hello", buf[0..5]);
+}
+
+test "mszip block with less than it says it has" {
+    var buf: [8]u8 = undefined;
+    const deflate = [_]u8{ 1, 3, 0, 0xfc, 0xff } ++ "abc";
+    try std.testing.expectError(error.MszipBlockTooShort, decompressMszipBlock(deflate, &buf, 0, 5));
+}
+
+test "mszip block that ends with an empty deflate block" {
+    // a stored block that isn't the final one, then an empty one that is
+    const deflate = [_]u8{ 0, 3, 0, 0xfc, 0xff } ++ "abc" ++ [_]u8{ 1, 0, 0, 0xff, 0xff };
+    var buf: [3]u8 = undefined;
+    try decompressMszipBlock(deflate, &buf, 0, 3);
+    try std.testing.expectEqualStrings("abc", &buf);
 }
 
 /// Reads the whole file into an allocation of exactly its size.

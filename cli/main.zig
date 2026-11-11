@@ -1,54 +1,84 @@
-pub fn main() !void {
+pub const std_options: std.Options = .{
+    // needs the std from zig-staticio, see build.zig
+    .io_vtable = .threaded,
+    .logFn = log,
+};
+
+/// Without colors, std's default sets them at every one of the many places that log, which adds
+/// tens of KiB to the exe.
+fn log(
+    comptime level: std.log.Level,
+    comptime scope: @EnumLiteral(),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const prefix = comptime level.asText() ++ if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
+    var buffer: [64]u8 = undefined;
+    const stderr = std.debug.lockStderr(&buffer);
+    defer std.debug.unlockStderr();
+    stderr.file_writer.interface.print(prefix ++ format ++ "\n", args) catch {};
+}
+
+pub fn main(init: std.process.Init.Minimal) !void {
     var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const arena = arena_instance.allocator();
+
+    var threaded: std.Io.Threaded = .init(arena, .{
+        .environ = init.environ,
+        .argv0 = .init(init.args),
+    });
+    const io = threaded.io();
 
     var opt: struct {
         verify: bool = false,
     } = .{};
 
-    const all_args = try std.process.argsAlloc(arena);
-    // no need to free, os will do it
+    var args_it = try init.args.iterateAllocator(arena);
+    // no need to deinit, os will do it
+    _ = args_it.skip();
 
-    const non_option_args = blk: {
-        var non_option_count: usize = 0;
-        var i: usize = 1;
-        while (i < all_args.len) : (i += 1) {
-            const arg = all_args[i];
-            if (!std.mem.startsWith(u8, arg, "-")) {
-                all_args[non_option_count] = arg;
-                non_option_count += 1;
-            } else if (std.mem.eql(u8, arg, "--verify")) {
-                opt.verify = true;
-            } else {
-                errExit("unknown cmdline option '{s}'", .{arg});
-            }
+    var non_option_args: [2][]const u8 = undefined;
+    var non_option_count: usize = 0;
+    while (args_it.next()) |arg| {
+        if (!std.mem.startsWith(u8, arg, "-")) {
+            if (non_option_count < non_option_args.len) non_option_args[non_option_count] = arg;
+            non_option_count += 1;
+        } else if (std.mem.eql(u8, arg, "--verify")) {
+            opt.verify = true;
+        } else {
+            errExit("unknown cmdline option '{s}'", .{arg});
         }
-        break :blk all_args[0..non_option_count];
-    };
-    if (non_option_args.len != 2) {
-        std.log.err("expected 2 cmdline args (MSI/DIR) but but {}", .{non_option_args.len});
+    }
+    if (non_option_count != non_option_args.len) {
+        std.log.err("expected 2 cmdline args (MSI/DIR) but but {}", .{non_option_count});
         std.process.exit(0xff);
     }
     const msi_path = non_option_args[0];
     const install_path = non_option_args[1];
 
     {
-        const start = try std.time.Instant.now();
+        const start = std.Io.Clock.awake.now(io);
         const msi_content = blk: {
-            const msi_file = std.fs.cwd().openFile(msi_path, .{}) catch |err| errExit(
-                "open '{s}' failed with {s}",
-                .{ msi_path, @errorName(err) },
+            const msi_file = std.Io.Dir.cwd().openFile(io, msi_path, .{ .allow_directory = false }) catch |err| errExit(
+                "open '{s}' failed with {t}",
+                .{ msi_path, err },
             );
-            defer msi_file.close();
-            break :blk try msi_file.readToEndAlloc(arena, std.math.maxInt(usize));
+            defer msi_file.close(io);
+            var msi_reader = msi_file.reader(io, &.{});
+            break :blk msi_reader.interface.allocRemaining(std.heap.page_allocator, .unlimited) catch |err| switch (err) {
+                error.ReadFailed => errExit("read '{s}' failed with {t}", .{ msi_path, msi_reader.err.? }),
+                error.OutOfMemory => |e| return e,
+                error.StreamTooLong => unreachable,
+            };
         };
-        defer arena.free(msi_content);
-        try msi.install(arena, .{
+        defer std.heap.page_allocator.free(msi_content);
+        try msi.install(io, arena, .{
             .cabs_dir = std.fs.path.dirname(msi_path) orelse ".",
             .msi_content = msi_content,
             .install_path = install_path,
+            .big_allocator = std.heap.page_allocator,
         });
-        const elapsed = (try std.time.Instant.now()).since(start);
+        const elapsed: u64 = @intCast(start.untilNow(io, .awake).toNanoseconds());
         std.log.info("installed msi in {d:.3} seconds", .{@as(f32, @floatFromInt(elapsed)) / std.time.ns_per_s});
     }
 
@@ -56,11 +86,11 @@ pub fn main() !void {
         std.log.info("verifying...", .{});
         const verify_path = try std.mem.concat(arena, u8, &.{ install_path, ".verify" });
         defer arena.free(verify_path);
-        try std.fs.cwd().deleteTree(verify_path);
+        try std.Io.Dir.cwd().deleteTree(io, verify_path);
 
-        const start = try std.time.Instant.now();
-        try msiexec(arena, msi_path, verify_path);
-        const elapsed = (try std.time.Instant.now()).since(start);
+        const start = std.Io.Clock.awake.now(io);
+        try msiexec(io, arena, msi_path, verify_path);
+        const elapsed: u64 = @intCast(start.untilNow(io, .awake).toNanoseconds());
         std.log.info("msiexec took {d:.3} seconds", .{@as(f32, @floatFromInt(elapsed)) / std.time.ns_per_s});
 
         // msiexec seems to copy the msi file for some reason?
@@ -68,24 +98,24 @@ pub fn main() !void {
             const copied_msi = try std.fs.path.join(arena, &.{ verify_path, std.fs.path.basename(msi_path) });
             defer arena.free(copied_msi);
             std.log.info("deleting copied msi '{s}'", .{copied_msi});
-            try std.fs.cwd().deleteFile(copied_msi);
+            try std.Io.Dir.cwd().deleteFile(io, copied_msi);
         }
 
-        var expected = try std.fs.cwd().openDir(verify_path, .{ .iterate = true });
-        defer expected.close();
-        var actual = try std.fs.cwd().openDir(install_path, .{ .iterate = true });
-        defer actual.close();
-        switch (try diffDirs(null, expected, actual)) {
+        const expected = try std.Io.Dir.cwd().openDir(io, verify_path, .{ .iterate = true });
+        defer expected.close(io);
+        const actual = try std.Io.Dir.cwd().openDir(io, install_path, .{ .iterate = true });
+        defer actual.close(io);
+        switch (try diffDirs(io, null, expected, actual)) {
             .identical => {
                 std.log.info("verified outputs match", .{});
-                try std.fs.cwd().deleteTree(verify_path);
+                try std.Io.Dir.cwd().deleteTree(io, verify_path);
             },
             .different => errExit("our msi installer differs from the official one (see differences above)", .{}),
         }
     }
 }
 
-fn msiexec(scratch: std.mem.Allocator, msi_file_path: []const u8, target_dir: []const u8) !void {
+fn msiexec(io: std.Io, scratch: std.mem.Allocator, msi_file_path: []const u8, target_dir: []const u8) !void {
     // msiexec has problem with paths that contain forward slaces
     const msi_path_fixed = try scratch.dupe(u8, msi_file_path);
     defer scratch.free(msi_path_fixed);
@@ -93,8 +123,8 @@ fn msiexec(scratch: std.mem.Allocator, msi_file_path: []const u8, target_dir: []
 
     // at least some MSI files require TARGETDIR to be an absolute path
     // also, realpath requires the directory to exist to work
-    try std.fs.cwd().makePath(target_dir);
-    const target_dir_abs = try std.fs.cwd().realpathAlloc(scratch, target_dir);
+    try std.Io.Dir.cwd().createDirPath(io, target_dir);
+    const target_dir_abs = try std.Io.Dir.cwd().realPathFileAlloc(io, target_dir, scratch);
     defer scratch.free(target_dir_abs);
     normalizePathSeps(target_dir_abs);
 
@@ -113,22 +143,19 @@ fn msiexec(scratch: std.mem.Allocator, msi_file_path: []const u8, target_dir: []
 
     {
         var stderr_buf: [1000]u8 = undefined;
-        var stderr: File15.Writer = .init(stderrFile(), &stderr_buf);
+        var stderr = std.Io.File.stderr().writerStreaming(io, &stderr_buf);
         flushRun(&stderr.interface, &argv) catch return stderr.err.?;
     }
 
-    const result = try std.process.Child.run(.{
-        .allocator = scratch,
-        .argv = &argv,
-    });
+    const result = try std.process.run(scratch, io, .{ .argv = &argv });
     defer {
         scratch.free(result.stdout);
         scratch.free(result.stderr);
     }
     switch (result.term) {
-        .Exited => |exit_code| {
+        .exited => |exit_code| {
             if (exit_code != 0) {
-                var stderr: File15.Writer = .init(stderrFile(), &.{});
+                var stderr = std.Io.File.stderr().writerStreaming(io, &.{});
                 stderr.interface.writeAll(result.stdout) catch return stderr.err.?;
                 stderr.interface.writeAll(result.stderr) catch return stderr.err.?;
                 errExit(
@@ -137,16 +164,16 @@ fn msiexec(scratch: std.mem.Allocator, msi_file_path: []const u8, target_dir: []
                 );
             }
         },
-        inline else => |e| {
-            var stderr: File15.Writer = .init(stderrFile(), &.{});
+        else => {
+            var stderr = std.Io.File.stderr().writerStreaming(io, &.{});
             stderr.interface.writeAll(result.stdout) catch return stderr.err.?;
             stderr.interface.writeAll(result.stderr) catch return stderr.err.?;
-            errExit("msiexec for '{s}' terminated with {}", .{ msi_file_path, e });
+            errExit("msiexec for '{s}' terminated with {any}", .{ msi_file_path, result.term });
         },
     }
 }
 
-fn flushRun(writer: *std15.Io.Writer, cli: []const []const u8) error{WriteFailed}!void {
+fn flushRun(writer: *std.Io.Writer, cli: []const []const u8) error{WriteFailed}!void {
     try writer.writeAll("run:");
     for (cli) |a| {
         const do_quote = std.mem.indexOfScalar(u8, a, ' ') != null;
@@ -167,13 +194,7 @@ fn normalizePathSeps(path: []u8) void {
 const PathNode = struct {
     parent: ?*const PathNode,
     name: []const u8,
-    pub const format = if (zig15) formatNew else formatOld;
-    pub fn formatNew(p: PathNode, writer: *std15.Io.Writer) error{WriteFailed}!void {
-        try formatOld(p, "", .{}, writer);
-    }
-    pub fn formatOld(p: PathNode, comptime fmt: []const u8, opt: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
-        _ = opt;
+    pub fn format(p: PathNode, writer: *std.Io.Writer) error{WriteFailed}!void {
         if (p.parent) |parent| {
             try writer.print("{f}{s}", .{ parent, std.fs.path.sep_str });
         }
@@ -181,18 +202,18 @@ const PathNode = struct {
     }
 };
 const Diff = enum { identical, different };
-fn diffDirs(parent: ?*const PathNode, expected: std.fs.Dir, actual: std.fs.Dir) !Diff {
+fn diffDirs(io: std.Io, parent: ?*const PathNode, expected: std.Io.Dir, actual: std.Io.Dir) !Diff {
     var result: Diff = .identical;
 
     // Pass 1: check all entries in expected exist and match in actual
     var exp_iter = expected.iterate();
-    while (try exp_iter.next()) |entry| {
+    while (try exp_iter.next(io)) |entry| {
         const path: PathNode = .{ .parent = parent, .name = entry.name };
         switch (entry.kind) {
             .file => {
-                const exp_file = try expected.openFile(path.name, .{});
-                defer exp_file.close();
-                const act_file = actual.openFile(path.name, .{}) catch |err| switch (err) {
+                const exp_file = try expected.openFile(io, path.name, .{});
+                defer exp_file.close(io);
+                const act_file = actual.openFile(io, path.name, .{}) catch |err| switch (err) {
                     error.FileNotFound => {
                         std.log.err("expected file not found in actual: '{f}'", .{path});
                         result = .different;
@@ -200,16 +221,16 @@ fn diffDirs(parent: ?*const PathNode, expected: std.fs.Dir, actual: std.fs.Dir) 
                     },
                     else => |e| return e,
                 };
-                defer act_file.close();
-                if (!try fileContentsEqual(exp_file, act_file)) {
+                defer act_file.close(io);
+                if (!try fileContentsEqual(io, exp_file, act_file)) {
                     std.log.err("file contents differ: '{f}'", .{path});
                     result = .different;
                 }
             },
             .directory => {
-                var exp_sub = try expected.openDir(path.name, .{ .iterate = true });
-                defer exp_sub.close();
-                var act_sub = actual.openDir(path.name, .{ .iterate = true }) catch |err| switch (err) {
+                const exp_sub = try expected.openDir(io, path.name, .{ .iterate = true });
+                defer exp_sub.close(io);
+                const act_sub = actual.openDir(io, path.name, .{ .iterate = true }) catch |err| switch (err) {
                     error.FileNotFound => {
                         std.log.err("expected directory not found in actual: '{f}'", .{path});
                         result = .different;
@@ -217,8 +238,8 @@ fn diffDirs(parent: ?*const PathNode, expected: std.fs.Dir, actual: std.fs.Dir) 
                     },
                     else => |e| return e,
                 };
-                defer act_sub.close();
-                if (try diffDirs(&path, exp_sub, act_sub) == .different) {
+                defer act_sub.close(io);
+                if (try diffDirs(io, &path, exp_sub, act_sub) == .different) {
                     result = .different;
                 }
             },
@@ -228,23 +249,23 @@ fn diffDirs(parent: ?*const PathNode, expected: std.fs.Dir, actual: std.fs.Dir) 
 
     // Pass 2: find entries only in actual (not in expected)
     var act_iter = actual.iterate();
-    while (try act_iter.next()) |entry| {
+    while (try act_iter.next(io)) |entry| {
         const name = entry.name;
         const found_in_expected = switch (entry.kind) {
             .file => blk: {
-                const f = expected.openFile(name, .{}) catch |err| switch (err) {
+                const f = expected.openFile(io, name, .{}) catch |err| switch (err) {
                     error.FileNotFound => break :blk false,
                     else => |e| return e,
                 };
-                f.close();
+                f.close(io);
                 break :blk true;
             },
             .directory => blk: {
-                var d = expected.openDir(name, .{}) catch |err| switch (err) {
+                const d = expected.openDir(io, name, .{}) catch |err| switch (err) {
                     error.FileNotFound => break :blk false,
                     else => |e| return e,
                 };
-                d.close();
+                d.close(io);
                 break :blk true;
             },
             else => continue,
@@ -258,18 +279,18 @@ fn diffDirs(parent: ?*const PathNode, expected: std.fs.Dir, actual: std.fs.Dir) 
     return result;
 }
 
-fn fileContentsEqual(a: std.fs.File, b: std.fs.File) !bool {
-    const stat_a = try a.stat();
-    const stat_b = try b.stat();
-    if (stat_a.size != stat_b.size) return false;
+fn fileContentsEqual(io: std.Io, a: std.Io.File, b: std.Io.File) !bool {
+    if (try a.length(io) != try b.length(io)) return false;
 
     var buf_a: [4096]u8 = undefined;
     var buf_b: [4096]u8 = undefined;
+    var offset: u64 = 0;
     while (true) {
-        const n_a = try a.read(&buf_a);
-        const n_b = try b.read(&buf_b);
+        const n_a = try a.readPositionalAll(io, &buf_a, offset);
+        const n_b = try b.readPositionalAll(io, &buf_b, offset);
         if (n_a != n_b or !std.mem.eql(u8, buf_a[0..n_a], buf_b[0..n_b])) return false;
         if (n_a == 0) return true;
+        offset += n_a;
     }
 }
 
@@ -277,14 +298,6 @@ fn errExit(comptime fmt: []const u8, args: anytype) noreturn {
     std.log.err(fmt, args);
     std.process.exit(0xff);
 }
-
-fn stderrFile() std.fs.File {
-    return if (zig15) std.fs.File.stderr() else std.io.getStdErr();
-}
-
-const zig15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
-const std15 = if (zig15) std else @import("std15");
-const File15 = if (zig15) std.fs.File else std15.fs.File15;
 
 const std = @import("std");
 const msi = @import("msi");

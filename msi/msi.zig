@@ -3,9 +3,13 @@ pub const InstallOptions = struct {
     /// Directory containing ".cab" files, typically the same directory where the ".msi" file is.
     cabs_dir: []const u8,
     install_path: []const u8,
+    /// For the content of a cab file and of each of its folders. These are up to 100s of MB each
+    /// and freed once they're extracted, so this shouldn't be an arena, which would hold onto all
+    /// of them until the end.
+    big_allocator: std.mem.Allocator = std.heap.page_allocator,
 };
 
-pub fn install(scratch: std.mem.Allocator, opt: InstallOptions) !void {
+pub fn install(io: std.Io, scratch: std.mem.Allocator, opt: InstallOptions) !void {
     var cfb = try Cfb.parse(opt.msi_content);
     try cfb.loadStructures(scratch);
 
@@ -13,10 +17,10 @@ pub fn install(scratch: std.mem.Allocator, opt: InstallOptions) !void {
     defer msi_db.deinit();
 
     if (msi_db.media_table.count() > 0) {
-        const cab_start = try std.time.Instant.now();
+        const cab_start = std.Io.Clock.awake.now(io);
 
-        var maybe_cabs_dir: ?std.fs.Dir = null;
-        defer if (maybe_cabs_dir) |*d| d.close();
+        var maybe_cabs_dir: ?std.Io.Dir = null;
+        defer if (maybe_cabs_dir) |d| d.close(io);
 
         var media_iter = msi_db.media_table.valueIterator();
         var found_external = false;
@@ -24,23 +28,24 @@ pub fn install(scratch: std.mem.Allocator, opt: InstallOptions) !void {
             if (media_entry.cabinet.len > 0) {
                 const cab_data = blk: {
                     if (maybe_cabs_dir == null) {
-                        maybe_cabs_dir = try std.fs.cwd().openDir(opt.cabs_dir, .{});
+                        maybe_cabs_dir = try std.Io.Dir.cwd().openDir(io, opt.cabs_dir, .{});
                     }
-                    const file = maybe_cabs_dir.?.openFile(media_entry.cabinet, .{}) catch |err| {
+                    const file = maybe_cabs_dir.?.openFile(io, media_entry.cabinet, .{}) catch |err| {
                         log.err("open cab file '{s}' failed with {}", .{ media_entry.cabinet, err });
                         return error.MissingCabFile;
                     };
-                    defer file.close();
-                    break :blk try file.readToEndAlloc(scratch, 1000 * 1024 * 1024); // 1000MB max
+                    defer file.close(io);
+                    break :blk try readToEndAlloc(io, file, opt.big_allocator, 1000 * 1024 * 1024); // 1000MB max
                 };
-                try std.fs.cwd().makePath(opt.install_path);
-                try extractCab(cab_data, opt.install_path, scratch, &msi_db);
+                defer opt.big_allocator.free(cab_data);
+                try std.Io.Dir.cwd().createDirPath(io, opt.install_path);
+                try extractCab(io, cab_data, opt.install_path, opt.big_allocator, scratch, &msi_db);
                 found_external = true;
             }
         }
 
         if (found_external) {
-            const cab_elapsed = (try std.time.Instant.now()).since(cab_start);
+            const cab_elapsed: u64 = @intCast(cab_start.untilNow(io, .awake).toNanoseconds());
             log.info("CAB extraction took {d:.3} seconds", .{@as(f32, @floatFromInt(cab_elapsed)) / std.time.ns_per_s});
             return;
         }
@@ -56,15 +61,15 @@ pub fn install(scratch: std.mem.Allocator, opt: InstallOptions) !void {
 
         if (stream_data.len >= 4 and std.mem.eql(u8, stream_data[0..4], "MSCF")) {
             log.info("found embedded CAB at stream index {}, size={} bytes", .{ i, stream_data.len });
-            try std.fs.cwd().makePath(opt.install_path);
-            try extractCab(stream_data, opt.install_path, scratch, &msi_db);
+            try std.Io.Dir.cwd().createDirPath(io, opt.install_path);
+            try extractCab(io, stream_data, opt.install_path, opt.big_allocator, scratch, &msi_db);
             log.info("MSI installation complete", .{});
             return;
         }
     }
 
     log.info("no CAB file found, nothing to extract", .{});
-    try std.fs.cwd().makePath(opt.install_path);
+    try std.Io.Dir.cwd().createDirPath(io, opt.install_path);
 }
 
 const CabHeaderFlags = packed struct(u16) {
@@ -74,7 +79,7 @@ const CabHeaderFlags = packed struct(u16) {
     _reserved: u13 = 0,
 };
 
-fn extractCab(cab_data: []const u8, target_dir: []const u8, allocator: std.mem.Allocator, msi_db: *MsiDatabase) !void {
+fn extractCab(io: std.Io, cab_data: []const u8, target_dir: []const u8, big_allocator: std.mem.Allocator, allocator: std.mem.Allocator, msi_db: *MsiDatabase) !void {
     if (cab_data.len < 36) return error.InvalidCabFile;
 
     if (!std.mem.eql(u8, cab_data[0..4], "MSCF"))
@@ -146,7 +151,7 @@ fn extractCab(cab_data: []const u8, target_dir: []const u8, allocator: std.mem.A
 
     var current_folder: ?u16 = null;
     var uncompressed_data: ?[]u8 = null;
-    defer if (uncompressed_data) |data| allocator.free(data);
+    defer if (uncompressed_data) |data| big_allocator.free(data);
 
     var extracted_count: usize = 0;
     var skipped_count: usize = 0;
@@ -154,10 +159,10 @@ fn extractCab(cab_data: []const u8, target_dir: []const u8, allocator: std.mem.A
     while (try file_iter.next()) |file_entry| {
         if (current_folder == null or current_folder.? != file_entry.folder_index) {
             if (uncompressed_data) |data| {
-                allocator.free(data);
+                big_allocator.free(data);
                 uncompressed_data = null;
             }
-            uncompressed_data = try decompressFolder(cab_data, file_entry.folder_index, folders_offset, allocator);
+            uncompressed_data = try decompressFolder(cab_data, file_entry.folder_index, folders_offset, big_allocator);
             current_folder = file_entry.folder_index;
         }
 
@@ -185,15 +190,15 @@ fn extractCab(cab_data: []const u8, target_dir: []const u8, allocator: std.mem.A
             if (comp_entry) |comp| {
                 const resolved_dir_path = try msi_db.resolveDirectoryPath(comp.directory, allocator);
 
-                var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
                 const full_target_dir = try std.fmt.bufPrint(&path_buf, "{s}{s}{s}", .{ target_dir, std.fs.path.sep_str, resolved_dir_path });
 
-                try std.fs.cwd().makePath(full_target_dir);
+                try std.Io.Dir.cwd().createDirPath(io, full_target_dir);
 
-                var full_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                var full_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
                 const full_path = try std.fmt.bufPrint(&full_path_buf, "{s}{s}{s}", .{ full_target_dir, std.fs.path.sep_str, actual_name });
 
-                const out_file = std.fs.cwd().createFile(full_path, .{}) catch |err| switch (err) {
+                const out_file = std.Io.Dir.cwd().createFile(io, full_path, .{}) catch |err| switch (err) {
                     error.PathAlreadyExists => {
                         log.warn("skipping existing file: {s}", .{full_path});
                         skipped_count += 1;
@@ -201,14 +206,14 @@ fn extractCab(cab_data: []const u8, target_dir: []const u8, allocator: std.mem.A
                     },
                     else => return err,
                 };
-                defer out_file.close();
-                try out_file.writeAll(file_data);
+                defer out_file.close(io);
+                try out_file.writeStreamingAll(io, file_data);
                 extracted_count += 1;
             } else {
-                var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
                 const full_path = try std.fmt.bufPrint(&path_buf, "{s}{s}{s}", .{ target_dir, std.fs.path.sep_str, actual_name });
 
-                const out_file = std.fs.cwd().createFile(full_path, .{}) catch |err| switch (err) {
+                const out_file = std.Io.Dir.cwd().createFile(io, full_path, .{}) catch |err| switch (err) {
                     error.PathAlreadyExists => {
                         log.warn("skipping existing file: {s}", .{full_path});
                         skipped_count += 1;
@@ -216,27 +221,27 @@ fn extractCab(cab_data: []const u8, target_dir: []const u8, allocator: std.mem.A
                     },
                     else => return err,
                 };
-                defer out_file.close();
-                try out_file.writeAll(file_data);
+                defer out_file.close(io);
+                try out_file.writeStreamingAll(io, file_data);
                 extracted_count += 1;
             }
         } else {
-            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const full_path = try std.fmt.bufPrint(&path_buf, "{s}{s}{s}", .{ target_dir, std.fs.path.sep_str, file_entry.filename });
 
             if (std.fs.path.dirname(full_path)) |dir| {
-                try std.fs.cwd().makePath(dir);
+                try std.Io.Dir.cwd().createDirPath(io, dir);
             }
 
-            const out_file = std.fs.cwd().createFile(full_path, .{}) catch |err| switch (err) {
+            const out_file = std.Io.Dir.cwd().createFile(io, full_path, .{}) catch |err| switch (err) {
                 error.PathAlreadyExists => {
                     skipped_count += 1;
                     continue;
                 },
                 else => return err,
             };
-            defer out_file.close();
-            try out_file.writeAll(file_data);
+            defer out_file.close(io);
+            try out_file.writeStreamingAll(io, file_data);
             extracted_count += 1;
         }
     }
@@ -328,19 +333,9 @@ fn decompressFolder(cab_data: []const u8, folder_index: u16, folders_offset: usi
     errdefer allocator.free(result_buf);
     var result_pos: usize = 0;
 
-    var decompress_window: []u8 = &.{};
-    var sliding_window: []u8 = &.{};
-    if (compression_type.method == .mszip) {
-        decompress_window = try allocator.alloc(u8, stdfork.compress.flate.max_window_len);
-        sliding_window = try allocator.alloc(u8, stdfork.compress.flate.history_len);
-    }
-    defer if (decompress_window.len > 0) allocator.free(decompress_window);
-    defer if (sliding_window.len > 0) allocator.free(sliding_window);
-
     var block_offset = data_offset;
-    var sliding_window_size: usize = 0;
-
     for (0..num_data_blocks) |block_num| {
+        const result_remaining = total_uncompressed - result_pos;
         if (block_offset + 8 > cab_data.len) return error.InvalidCabFile;
 
         const checksum = std.mem.readInt(u32, cab_data[block_offset..][0..4], .little);
@@ -357,6 +352,10 @@ fn decompressFolder(cab_data: []const u8, folder_index: u16, folders_offset: usi
 
         switch (compression_type.method) {
             .none => {
+                if (compressed_data.len > result_remaining) {
+                    log.err("CAB block {} has {} bytes but only {} are left in its folder", .{ block_num, compressed_data.len, result_remaining });
+                    return error.InvalidCabFile;
+                }
                 @memcpy(result_buf[result_pos..][0..compressed_data.len], compressed_data);
                 result_pos += compressed_data.len;
             },
@@ -365,33 +364,30 @@ fn decompressFolder(cab_data: []const u8, folder_index: u16, folders_offset: usi
                 if (compressed_data.len < 2) return error.InvalidMszipData;
                 if (compressed_data[0] != 'C' or compressed_data[1] != 'K') return error.InvalidMszipSignature;
 
-                // Copy sliding window into decompressor buffer for backreferences
-                if (block_num > 0) {
-                    @memcpy(decompress_window[0..sliding_window_size], sliding_window[0..sliding_window_size]);
-                }
-
-                var input_reader = std15.Io.Reader.fixed(compressed_data[2..]);
-                var decompress = if (block_num == 0)
-                    stdfork.compress.flate.Decompress.init(&input_reader, .raw, decompress_window)
-                else
-                    stdfork.compress.flate.Decompress.initPreservingWindow(&input_reader, .raw, decompress_window, sliding_window_size);
-
-                const decompressed_block = result_buf[result_pos..][0..uncompressed_size];
-                try decompress.reader.readSliceAll(decompressed_block);
+                // Each block is its own deflate stream, but its matches can reach back into
+                // the previous blocks, so it's decompressed right after them where they serve
+                // as its history.
+                var input: std.Io.Reader = .fixed(compressed_data[2..]);
+                var decompress: std.compress.flate.Decompress = .init(&input, .raw, &.{});
+                var output: std.Io.Writer = .fixed(result_buf);
+                output.end = result_pos;
+                // Only as much as the block says it has and not until the end of the deflate
+                // stream, a block doesn't have to end its stream.
+                decompress.reader.streamExact(&output, uncompressed_size) catch |err| switch (err) {
+                    error.ReadFailed => {
+                        log.err("decompressing CAB block {} failed with {t}", .{ block_num, decompress.err.? });
+                        return decompress.err.?;
+                    },
+                    error.EndOfStream => {
+                        log.err("CAB block {} decompressed to {} bytes but expected {}", .{ block_num, output.end - result_pos, uncompressed_size });
+                        return error.InvalidMszipData;
+                    },
+                    error.WriteFailed => {
+                        log.err("CAB block {} has {} bytes but only {} are left in its folder", .{ block_num, uncompressed_size, result_remaining });
+                        return error.InvalidMszipData;
+                    },
+                };
                 result_pos += uncompressed_size;
-
-                if (uncompressed_size >= stdfork.compress.flate.history_len) {
-                    @memcpy(sliding_window, decompressed_block[uncompressed_size - stdfork.compress.flate.history_len ..]);
-                    sliding_window_size = stdfork.compress.flate.history_len;
-                } else if (sliding_window_size + uncompressed_size <= stdfork.compress.flate.history_len) {
-                    @memcpy(sliding_window[sliding_window_size..][0..uncompressed_size], decompressed_block);
-                    sliding_window_size += uncompressed_size;
-                } else {
-                    const keep_from_old = stdfork.compress.flate.history_len - uncompressed_size;
-                    vers.memmove(sliding_window[0..keep_from_old], sliding_window[sliding_window_size - keep_from_old .. sliding_window_size]);
-                    @memcpy(sliding_window[keep_from_old..stdfork.compress.flate.history_len], decompressed_block);
-                    sliding_window_size = stdfork.compress.flate.history_len;
-                }
             },
             .quantum, .lzx => {
                 log.err("unsupported CAB compression method: {s}", .{@tagName(compression_type.method)});
@@ -400,7 +396,77 @@ fn decompressFolder(cab_data: []const u8, folder_index: u16, folders_offset: usi
         }
     }
 
+    if (result_pos != total_uncompressed) {
+        log.err("CAB folder {} has {} bytes but expected {}", .{ folder_index, result_pos, total_uncompressed });
+        return error.InvalidCabFile;
+    }
     return result_buf;
+}
+
+/// Makes a cab with only what `decompressFolder` reads, one folder and its data blocks.
+fn testCab(buf: []u8, method: u16, blocks: []const struct { data: []const u8, uncompressed_size: u16 }) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeInt(u32, 8, .little) catch unreachable; // offset of the first data block
+    w.writeInt(u16, @intCast(blocks.len), .little) catch unreachable;
+    w.writeInt(u16, method, .little) catch unreachable;
+    for (blocks) |block| {
+        w.writeInt(u32, 0, .little) catch unreachable; // checksum
+        w.writeInt(u16, @intCast(block.data.len), .little) catch unreachable;
+        w.writeInt(u16, block.uncompressed_size, .little) catch unreachable;
+        w.writeAll(block.data) catch unreachable;
+    }
+    return w.buffered();
+}
+
+test "mszip block that doesn't end its deflate stream" {
+    var buf: [100]u8 = undefined;
+    // a stored block without the final block bit
+    const cab = testCab(&buf, 1, &.{
+        .{ .data = "CK" ++ [_]u8{ 0, 5, 0, 0xfa, 0xff } ++ "hello", .uncompressed_size = 5 },
+    });
+    const data = try decompressFolder(cab, 0, 0, std.testing.allocator);
+    defer std.testing.allocator.free(data);
+    try std.testing.expectEqualStrings("hello", data);
+}
+
+test "mszip block with nothing in it" {
+    var buf: [100]u8 = undefined;
+    const cab = testCab(&buf, 1, &.{
+        .{ .data = "CK" ++ [_]u8{ 1, 3, 0, 0xfc, 0xff } ++ "abc", .uncompressed_size = 3 },
+        .{ .data = "CK", .uncompressed_size = 0 },
+    });
+    const data = try decompressFolder(cab, 0, 0, std.testing.allocator);
+    defer std.testing.allocator.free(data);
+    try std.testing.expectEqualStrings("abc", data);
+}
+
+test "mszip block with a match in the previous block" {
+    var buf: [100]u8 = undefined;
+    const cab = testCab(&buf, 1, &.{
+        .{ .data = "CK" ++ [_]u8{ 1, 8, 0, 0xf7, 0xff } ++ "abcdefgh", .uncompressed_size = 8 },
+        // a fixed huffman block with a match of length 8 at distance 8
+        .{ .data = "CK" ++ [_]u8{ 0x83, 0xd1, 0x00 }, .uncompressed_size = 8 },
+    });
+    const data = try decompressFolder(cab, 0, 0, std.testing.allocator);
+    defer std.testing.allocator.free(data);
+    try std.testing.expectEqualStrings("abcdefghabcdefgh", data);
+}
+
+/// Reads the whole file into an allocation of exactly its size.
+fn readToEndAlloc(io: std.Io, file: std.Io.File, allocator: std.mem.Allocator, max_size: usize) ![]u8 {
+    const size = try file.length(io);
+    if (size > max_size) {
+        log.err("file is {} bytes which exceeds the max of {}", .{ size, max_size });
+        return error.FileTooBig;
+    }
+    const content = try allocator.alloc(u8, @intCast(size));
+    errdefer allocator.free(content);
+    const read_size = try file.readPositionalAll(io, content, 0);
+    if (read_size != content.len) {
+        log.err("file is {} bytes but only read {}", .{ content.len, read_size });
+        return error.UnexpectedEndOfFile;
+    }
+    return content;
 }
 
 // Compound File Binary (CFB) Format Parser
@@ -1487,7 +1553,7 @@ const MsiDatabase = struct {
             return cached_path;
         }
 
-        var path_parts: std.ArrayListUnmanaged([]const u8) = .{};
+        var path_parts: std.ArrayList([]const u8) = .empty;
         defer path_parts.deinit(allocator);
 
         var current_dir_id = dir_id;
@@ -1569,12 +1635,7 @@ fn asIndex(index: u64) error{IndexOutOfRange}!usize {
     };
 }
 
-const zig15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
-const std15 = if (zig15) std else @import("std15");
-const vers = @import("vers");
-
 const log = std.log.scoped(.msi);
 
 const std = @import("std");
-const stdfork = @import("stdfork");
-const ArrayList = if (zig15) std.ArrayList else std.ArrayListUnmanaged;
+const ArrayList = std.ArrayList;

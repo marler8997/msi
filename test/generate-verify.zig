@@ -1,11 +1,23 @@
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const arena = arena_instance.allocator();
-    const all_args = try std.process.argsAlloc(arena);
-    // no need to free, os will do it
 
-    const args = all_args[@min(all_args.len, 1)..];
-    if (args.len != 5) errExit("expected 5 cmdline args but got {}", .{args.len});
+    var threaded: std.Io.Threaded = .init(arena, .{
+        .environ = init.environ,
+        .argv0 = .init(init.args),
+    });
+    const io = threaded.io();
+
+    var args_it = try init.args.iterateAllocator(arena);
+    // no need to deinit, os will do it
+    _ = args_it.skip();
+
+    var args: [5][]const u8 = undefined;
+    var arg_count: usize = 0;
+    while (args_it.next()) |arg| : (arg_count += 1) {
+        if (arg_count < args.len) args[arg_count] = arg;
+    }
+    if (arg_count != args.len) errExit("expected 5 cmdline args but got {}", .{arg_count});
 
     const cache_path = args[0];
     const scratch_path = args[1];
@@ -15,19 +27,19 @@ pub fn main() !void {
 
     // we commit the output to source control so that all platforms can just re-use
     // the output of msiexec for verification
-    if (std.fs.cwd().access(output_path_src, .{})) {
-        if (std.fs.path.dirname(output_path_cache)) |d| try std.fs.cwd().makePath(d);
-        try std.fs.cwd().copyFile(output_path_src, std.fs.cwd(), output_path_cache, .{});
+    if (std.Io.Dir.cwd().access(io, output_path_src, .{})) {
+        if (std.fs.path.dirname(output_path_cache)) |d| try std.Io.Dir.cwd().createDirPath(io, d);
+        try std.Io.Dir.copyFile(.cwd(), output_path_src, .cwd(), output_path_cache, io, .{});
         return;
     } else |err| switch (err) {
         error.FileNotFound => {},
         else => |e| return e,
     }
 
-    const test_file: common.File = try .read(arena, test_path);
+    const test_file: common.File = try .read(io, arena, test_path);
     defer test_file.deinit(arena);
 
-    try test_file.fetchAll(arena, cache_path, scratch_path);
+    try test_file.fetchAll(io, arena, cache_path, scratch_path);
 
     var found_msi = false;
 
@@ -44,59 +56,30 @@ pub fn main() !void {
         defer arena.free(installer_path);
         const install_path = try std.fs.path.join(arena, &.{ scratch_path, "install-msiexec" });
         defer arena.free(install_path);
-        try msiexec(arena, cache_path, installer_path, install_path);
+        try msiexec(io, arena, cache_path, installer_path, install_path);
 
         // msiexec seems to copy the msi file for some reason?
         {
             const copied_msi = try std.fs.path.join(arena, &.{ install_path, basename });
             defer arena.free(copied_msi);
             std.log.info("deleting copied msi '{s}'", .{copied_msi});
-            try std.fs.cwd().deleteFile(copied_msi);
+            try std.Io.Dir.cwd().deleteFile(io, copied_msi);
         }
 
         {
-            const tree = try common.allocTree(arena, install_path);
+            const tree = try common.allocTree(io, arena, install_path);
             defer arena.free(tree);
             for (&[_][]const u8{ output_path_src, output_path_cache }) |output_path| {
-                try std.fs.cwd().makePath(std.fs.path.dirname(output_path).?);
-                const output_file = try std.fs.cwd().createFile(output_path, .{});
-                defer output_file.close();
-                try output_file.writeAll(tree);
+                try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(output_path).?);
+                try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output_path, .data = tree });
             }
         }
-        try std.fs.cwd().deleteTree(scratch_path);
+        try std.Io.Dir.cwd().deleteTree(io, scratch_path);
     }
-}
-
-// TODO: implement this at the end
-fn acquireGlobalLock(allocator: std.mem.Allocator) !std.fs.File {
-    const lock_path = try std.fs.getAppDataDir(allocator, "msiexecwrapper.lock");
-    defer allocator.free(lock_path);
-
-    if (std.fs.path.dirname(lock_path)) |dir| {
-        try std.fs.cwd().makePath(dir);
-    }
-
-    // Try to create lock file exclusively
-    while (true) {
-        const lock_file = std.fs.cwd().createFile(lock_path, .{ .exclusive = true }) catch |err| switch (err) {
-            error.PathAlreadyExists => {
-                // Lock held by another process, wait and retry
-                std.Thread.sleep(100 * std.time.ns_per_ms);
-                continue;
-            },
-            else => return err,
-        };
-        return lock_file;
-    }
-}
-
-fn releaseLock(lock_file: std.fs.File) void {
-    lock_file.close();
-    // Note: we don't delete the lock file as close() should release it on Windows
 }
 
 fn msiexec(
+    io: std.Io,
     scratch: std.mem.Allocator,
     lock_parent_path: []const u8,
     msi_file_path: []const u8,
@@ -109,8 +92,8 @@ fn msiexec(
 
     // at least some MSI files require TARGETDIR to be an absolute path
     // also, realpath requires the directory to exist to work
-    try std.fs.cwd().makePath(target_dir);
-    const target_dir_abs = try std.fs.cwd().realpathAlloc(scratch, target_dir);
+    try std.Io.Dir.cwd().createDirPath(io, target_dir);
+    const target_dir_abs = try std.Io.Dir.cwd().realPathFileAlloc(io, target_dir, scratch);
     defer scratch.free(target_dir_abs);
     normalizePathSeps(target_dir_abs);
 
@@ -129,7 +112,7 @@ fn msiexec(
 
     {
         var stderr_buf: [1000]u8 = undefined;
-        var stderr: File15.Writer = .init(stderrFile(), &stderr_buf);
+        var stderr = std.Io.File.stderr().writerStreaming(io, &stderr_buf);
         common.flushRun(&stderr.interface, &argv) catch return stderr.err.?;
     }
 
@@ -140,24 +123,21 @@ fn msiexec(
     const lock_path = try std.fs.path.join(scratch, &.{ lock_parent_path, "msiexec.lock" });
     defer scratch.free(lock_path);
     std.log.info("locking '{s}'...", .{lock_path});
-    const lock_start = try std.time.Instant.now();
-    var lock = try LockFile.lock(lock_path);
-    defer lock.unlock();
-    const lock_elapsed = (try std.time.Instant.now()).since(lock_start);
+    const lock_start = std.Io.Clock.awake.now(io);
+    var lock = try LockFile.lock(io, lock_path);
+    defer lock.unlock(io);
+    const lock_elapsed: u64 = @intCast(lock_start.untilNow(io, .awake).toNanoseconds());
     std.log.info("lock acquired after {} seconds", .{@as(f32, @floatFromInt(lock_elapsed)) / std.time.ns_per_s});
 
-    const result = try std.process.Child.run(.{
-        .allocator = scratch,
-        .argv = &argv,
-    });
+    const result = try std.process.run(scratch, io, .{ .argv = &argv });
     defer {
         scratch.free(result.stdout);
         scratch.free(result.stderr);
     }
     switch (result.term) {
-        .Exited => |exit_code| {
+        .exited => |exit_code| {
             if (exit_code != 0) {
-                var stderr: File15.Writer = .init(stderrFile(), &.{});
+                var stderr = std.Io.File.stderr().writerStreaming(io, &.{});
                 stderr.interface.writeAll(result.stdout) catch return stderr.err.?;
                 stderr.interface.writeAll(result.stderr) catch return stderr.err.?;
                 errExit(
@@ -166,11 +146,11 @@ fn msiexec(
                 );
             }
         },
-        inline else => |e| {
-            var stderr: File15.Writer = .init(stderrFile(), &.{});
+        else => {
+            var stderr = std.Io.File.stderr().writerStreaming(io, &.{});
             stderr.interface.writeAll(result.stdout) catch return stderr.err.?;
             stderr.interface.writeAll(result.stderr) catch return stderr.err.?;
-            errExit("msiexec for '{s}' terminated with {}", .{ msi_file_path, e });
+            errExit("msiexec for '{s}' terminated with {any}", .{ msi_file_path, result.term });
         },
     }
 }
@@ -186,14 +166,6 @@ fn errExit(comptime fmt: []const u8, args: anytype) noreturn {
     std.log.err(fmt, args);
     std.process.exit(0xff);
 }
-
-fn stderrFile() std.fs.File {
-    return if (zig15) std.fs.File.stderr() else std.io.getStdErr();
-}
-
-const zig15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
-const std15 = if (zig15) std else @import("std15");
-const File15 = if (zig15) std.fs.File else std15.fs.File15;
 
 const std = @import("std");
 const common = @import("common.zig");

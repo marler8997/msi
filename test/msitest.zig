@@ -1,11 +1,23 @@
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     var arena_instance = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     const arena = arena_instance.allocator();
-    const all_args = try std.process.argsAlloc(arena);
-    // no need to free, os will do it
 
-    const args = all_args[@min(all_args.len, 1)..];
-    if (args.len != 5) errExit("expected 5 cmdline args but got {}", .{args.len});
+    var threaded: std.Io.Threaded = .init(arena, .{
+        .environ = init.environ,
+        .argv0 = .init(init.args),
+    });
+    const io = threaded.io();
+
+    var args_it = try init.args.iterateAllocator(arena);
+    // no need to deinit, os will do it
+    _ = args_it.skip();
+
+    var args: [5][]const u8 = undefined;
+    var arg_count: usize = 0;
+    while (args_it.next()) |arg| : (arg_count += 1) {
+        if (arg_count < args.len) args[arg_count] = arg;
+    }
+    if (arg_count != args.len) errExit("expected 5 cmdline args but got {}", .{arg_count});
 
     const msi_exe = args[0];
     const cache_path = args[1];
@@ -13,14 +25,14 @@ pub fn main() !void {
     const test_path = args[3];
     const verify_path = args[4];
 
-    const verify_tree = try std.fs.cwd().readFileAlloc(arena, verify_path, std.math.maxInt(usize));
+    const verify_tree = try std.Io.Dir.cwd().readFileAlloc(io, verify_path, arena, .unlimited);
 
-    try std.fs.cwd().deleteTree(scratch_path);
+    try std.Io.Dir.cwd().deleteTree(io, scratch_path);
 
-    const test_file: common.File = try .read(arena, test_path);
+    const test_file: common.File = try .read(io, arena, test_path);
     defer test_file.deinit(arena);
 
-    try test_file.fetchAll(arena, cache_path, scratch_path);
+    try test_file.fetchAll(io, arena, cache_path, scratch_path);
 
     var test_it = test_file.iterator();
     while (test_it.next()) |entry| {
@@ -39,33 +51,30 @@ pub fn main() !void {
         };
         {
             var stderr_buf: [1000]u8 = undefined;
-            var stderr: File15.Writer = .init(stderrFile(), &stderr_buf);
+            var stderr = std.Io.File.stderr().writerStreaming(io, &stderr_buf);
             common.flushRun(&stderr.interface, &argv) catch return stderr.err.?;
         }
         var proc_arena = std.heap.ArenaAllocator.init(arena);
         defer proc_arena.deinit();
-        const result = try std.process.Child.run(.{
-            .allocator = proc_arena.allocator(),
-            .argv = &argv,
-        });
+        const result = try std.process.run(proc_arena.allocator(), io, .{ .argv = &argv });
         {
-            var stdout: File15.Writer = .init(stdoutFile(), &.{});
+            var stdout = std.Io.File.stdout().writerStreaming(io, &.{});
             stdout.interface.writeAll(result.stdout) catch return stdout.err.?;
         }
         {
-            var stderr: File15.Writer = .init(stderrFile(), &.{});
+            var stderr = std.Io.File.stderr().writerStreaming(io, &.{});
             stderr.interface.writeAll(result.stderr) catch return stderr.err.?;
         }
         switch (result.term) {
-            .Exited => |code| if (code != 0) errExit("msi exited with code {}", .{code}),
-            inline else => |sig, result_kind| errExit("msi stopped ({s}) with {}", .{ @tagName(result_kind), sig }),
+            .exited => |code| if (code != 0) errExit("msi exited with code {}", .{code}),
+            else => errExit("msi stopped with {any}", .{result.term}),
         }
 
-        const our_tree = try common.allocTree(arena, install_path);
+        const our_tree = try common.allocTree(io, arena, install_path);
         defer arena.free(our_tree);
         if (!std.mem.eql(u8, verify_tree, our_tree)) {
             var stderr_buf: [2000]u8 = undefined;
-            var stderr: File15.Writer = .init(stderrFile(), &stderr_buf);
+            var stderr = std.Io.File.stderr().writerStreaming(io, &stderr_buf);
             const w = &stderr.interface;
             writeMismatch(w, verify_tree, our_tree) catch return stderr.err.?;
             writeDiff(w, verify_tree, our_tree) catch return stderr.err.?;
@@ -74,9 +83,9 @@ pub fn main() !void {
 
         const keep_installer = true;
         if (keep_installer) {
-            try std.fs.cwd().deleteTree(install_path);
+            try std.Io.Dir.cwd().deleteTree(io, install_path);
         } else {
-            try std.fs.cwd().deleteTree(scratch_path);
+            try std.Io.Dir.cwd().deleteTree(io, scratch_path);
         }
     }
 }
@@ -91,7 +100,7 @@ fn countLines(tree: []const u8) u32 {
 }
 
 fn writeMismatch(
-    writer: *std15.Io.Writer,
+    writer: *std.Io.Writer,
     msiexec_tree: []const u8,
     our_tree: []const u8,
 ) error{WriteFailed}!void {
@@ -104,7 +113,7 @@ fn writeMismatch(
 }
 
 fn writeDiff(
-    writer: *std15.Io.Writer,
+    writer: *std.Io.Writer,
     msiexec_tree: []const u8,
     our_tree: []const u8,
 ) error{WriteFailed}!void {
@@ -135,17 +144,6 @@ fn errExit(comptime fmt: []const u8, args: anytype) noreturn {
     std.log.err(fmt, args);
     std.process.exit(0xff);
 }
-
-fn stdoutFile() std.fs.File {
-    return if (zig15) std.fs.File.stdout() else std.io.getStdOut();
-}
-fn stderrFile() std.fs.File {
-    return if (zig15) std.fs.File.stderr() else std.io.getStdErr();
-}
-
-const zig15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
-const std15 = if (zig15) std else @import("std15");
-const File15 = if (zig15) std.fs.File else std15.fs.File15;
 
 const builtin = @import("builtin");
 const std = @import("std");

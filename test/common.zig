@@ -24,14 +24,8 @@ pub const Sha = struct {
         std.debug.assert(64 == (std.fmt.bufPrint(&buf, "{f}", .{sha}) catch unreachable).len);
         return buf;
     }
-    pub const format = if (zig15) formatNew else formatOld;
-    pub fn formatNew(value: Sha, writer: *std.Io.Writer) error{WriteFailed}!void {
+    pub fn format(value: Sha, writer: *std.Io.Writer) error{WriteFailed}!void {
         try writer.print("{x}", .{&value.bytes});
-    }
-    pub fn formatOld(value: Sha, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-        _ = fmt;
-        _ = options;
-        try writer.print("{}", .{std.fmt.fmtSliceHexLower(&value.bytes)});
     }
 };
 
@@ -39,14 +33,10 @@ pub const File = struct {
     path: []const u8,
     content: []const u8,
 
-    pub fn read(allocator: std.mem.Allocator, path: []const u8) !File {
+    pub fn read(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !File {
         return .{
             .path = path,
-            .content = blk: {
-                const file = try std.fs.cwd().openFile(path, .{});
-                defer file.close();
-                break :blk try file.readToEndAlloc(allocator, std.math.maxInt(usize));
-            },
+            .content = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .unlimited),
         };
     }
     pub fn deinit(file: *const File, allocator: std.mem.Allocator) void {
@@ -62,6 +52,7 @@ pub const File = struct {
 
     pub fn fetchAll(
         file: *const File,
+        io: std.Io,
         scratch: std.mem.Allocator,
         cache_path: []const u8,
         scratch_path: []const u8,
@@ -74,11 +65,11 @@ pub const File = struct {
             const file_cache_path = try std.fs.path.join(scratch, &.{ cache_path, cache_basename });
             defer scratch.free(file_cache_path);
 
-            try fetch(scratch, entry.uri, file_cache_path);
+            try fetch(io, scratch, entry.uri, file_cache_path);
             const installer_path = try std.fs.path.join(scratch, &.{ scratch_path, "installer", basename });
             defer scratch.free(installer_path);
-            try std.fs.cwd().makePath(std.fs.path.dirname(installer_path).?);
-            try std.fs.cwd().copyFile(file_cache_path, std.fs.cwd(), installer_path, .{});
+            try std.Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(installer_path).?);
+            try std.Io.Dir.copyFile(.cwd(), file_cache_path, .cwd(), installer_path, io, .{});
         }
     }
 };
@@ -126,15 +117,15 @@ fn nextLine(it: *std.mem.SplitIterator(u8, .scalar), lineno: *u32) ?[]const u8 {
     }
 }
 
-fn fetch(scratch: std.mem.Allocator, uri: []const u8, out: []const u8) !void {
-    if (std.fs.path.dirname(out)) |d| try std.fs.cwd().makePath(d);
+fn fetch(io: std.Io, scratch: std.mem.Allocator, uri: []const u8, out: []const u8) !void {
+    if (std.fs.path.dirname(out)) |d| try std.Io.Dir.cwd().createDirPath(io, d);
 
     const lock_path = try std.mem.concat(scratch, u8, &.{ out, ".lock" });
     defer scratch.free(lock_path);
-    var lock = try LockFile.lock(lock_path);
-    defer lock.unlock();
+    var lock = try LockFile.lock(io, lock_path);
+    defer lock.unlock(io);
 
-    if (std.fs.cwd().access(out, .{})) {
+    if (std.Io.Dir.cwd().access(io, out, .{})) {
         std.log.info("{s}: already fetched", .{out});
         return;
     } else |err| switch (err) {
@@ -150,31 +141,25 @@ fn fetch(scratch: std.mem.Allocator, uri: []const u8, out: []const u8) !void {
     };
     {
         var stderr_buf: [1000]u8 = undefined;
-        var stderr: File15.Writer = .init(stderrFile(), &stderr_buf);
+        var stderr = std.Io.File.stderr().writerStreaming(io, &stderr_buf);
         flushRun(&stderr.interface, &argv) catch return stderr.err.?;
     }
 
     var proc_arena = std.heap.ArenaAllocator.init(scratch);
     defer proc_arena.deinit();
-    const result = try std.process.Child.run(.{
-        .allocator = proc_arena.allocator(),
-        .argv = &argv,
-    });
-    if (switch (result.term) {
-        .Exited => |code| code != 0,
-        else => true,
-    }) {
-        var stderr: File15.Writer = .init(stderrFile(), &.{});
+    const result = try std.process.run(proc_arena.allocator(), io, .{ .argv = &argv });
+    if (!result.term.success()) {
+        var stderr = std.Io.File.stderr().writerStreaming(io, &.{});
         stderr.interface.writeAll(result.stdout) catch return stderr.err.?;
         stderr.interface.writeAll(result.stderr) catch return stderr.err.?;
     }
     switch (result.term) {
-        .Exited => |code| if (code != 0) errExit("curl exited with code {}", .{code}),
-        inline else => |sig, kind| errExit("curl stopped ({s}) with {}", .{ @tagName(kind), sig }),
+        .exited => |code| if (code != 0) errExit("curl exited with code {}", .{code}),
+        else => errExit("curl stopped with {any}", .{result.term}),
     }
 }
 
-pub fn flushRun(writer: *std15.Io.Writer, cli: []const []const u8) error{WriteFailed}!void {
+pub fn flushRun(writer: *std.Io.Writer, cli: []const []const u8) error{WriteFailed}!void {
     var prefix: []const u8 = "";
     for (cli) |a| {
         const do_quote = std.mem.indexOfScalar(u8, a, ' ') != null;
@@ -209,17 +194,17 @@ fn uriEncode(arena: std.mem.Allocator, raw: []const u8) ![]const u8 {
     return buf;
 }
 
-pub fn allocTree(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    var tree: std15.Io.Writer.Allocating = try .initCapacity(allocator, 4096);
+pub fn allocTree(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var tree: std.Io.Writer.Allocating = try .initCapacity(allocator, 4096);
     defer tree.deinit();
-    writeTree(&tree.writer, allocator, path) catch |err| switch (err) {
+    writeTree(&tree.writer, io, allocator, path) catch |err| switch (err) {
         error.WriteFailed => return error.OutOfMemory,
         else => |e| return e,
     };
     return tree.toOwnedSlice();
 }
 
-fn writeTree(writer: *std15.Io.Writer, allocator: std.mem.Allocator, install_dir: []const u8) !void {
+fn writeTree(writer: *std.Io.Writer, io: std.Io, allocator: std.mem.Allocator, install_dir: []const u8) !void {
     // Collect all output lines
     var lines = try ArrayList([]const u8).initCapacity(allocator, 1024);
     defer {
@@ -228,10 +213,10 @@ fn writeTree(writer: *std15.Io.Writer, allocator: std.mem.Allocator, install_dir
     }
 
     // Walk directory tree
-    var dir = try std.fs.cwd().openDir(install_dir, .{ .iterate = true });
-    defer dir.close();
+    const dir = try std.Io.Dir.cwd().openDir(io, install_dir, .{ .iterate = true });
+    defer dir.close(io);
 
-    try walkDirectory(allocator, dir, "", &lines);
+    try walkDirectory(io, allocator, dir, "", &lines);
 
     // Sort all lines for reproducibility
     std.mem.sort([]const u8, lines.items, {}, struct {
@@ -248,20 +233,25 @@ fn writeTree(writer: *std15.Io.Writer, allocator: std.mem.Allocator, install_dir
     try writer.flush();
 }
 
-fn walkDirectory(allocator: std.mem.Allocator, dir: std.fs.Dir, rel_path: []const u8, lines: *ArrayList([]const u8)) !void {
+const TreeEntry = struct {
+    name: []const u8,
+    kind: std.Io.File.Kind,
+};
+
+fn walkDirectory(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, rel_path: []const u8, lines: *ArrayList([]const u8)) !void {
     var iter = dir.iterate();
-    var entries = try ArrayList(std.fs.Dir.Entry).initCapacity(allocator, 32);
+    var entries = try ArrayList(TreeEntry).initCapacity(allocator, 32);
     defer entries.deinit(allocator);
 
     // Collect all entries
-    while (try iter.next()) |entry| {
+    while (try iter.next(io)) |entry| {
         const name_copy = try allocator.dupe(u8, entry.name);
         try entries.append(allocator, .{ .name = name_copy, .kind = entry.kind });
     }
 
     // Sort for deterministic output
-    std.mem.sort(std.fs.Dir.Entry, entries.items, {}, struct {
-        fn lessThan(_: void, a: std.fs.Dir.Entry, b: std.fs.Dir.Entry) bool {
+    std.mem.sort(TreeEntry, entries.items, {}, struct {
+        fn lessThan(_: void, a: TreeEntry, b: TreeEntry) bool {
             return std.mem.lessThan(u8, a.name, b.name);
         }
     }.lessThan);
@@ -278,15 +268,17 @@ fn walkDirectory(allocator: std.mem.Allocator, dir: std.fs.Dir, rel_path: []cons
         switch (entry.kind) {
             .file => {
                 // Calculate SHA256 hash
-                const file = try dir.openFile(entry.name, .{});
-                defer file.close();
+                const file = try dir.openFile(io, entry.name, .{});
+                defer file.close(io);
 
                 var hasher = std.crypto.hash.sha2.Sha256.init(.{});
                 var buf: [4096]u8 = undefined;
+                var offset: u64 = 0;
                 while (true) {
-                    const n = try file.read(&buf);
+                    const n = try file.readPositionalAll(io, &buf, offset);
                     if (n == 0) break;
                     hasher.update(buf[0..n]);
+                    offset += n;
                 }
 
                 var hash: [32]u8 = undefined;
@@ -301,16 +293,16 @@ fn walkDirectory(allocator: std.mem.Allocator, dir: std.fs.Dir, rel_path: []cons
                 try lines.append(allocator, line);
             },
             .directory => {
-                var subdir = try dir.openDir(entry.name, .{ .iterate = true });
-                defer subdir.close();
+                const subdir = try dir.openDir(io, entry.name, .{ .iterate = true });
+                defer subdir.close(io);
 
                 // Check if directory is empty
                 var subiter = subdir.iterate();
-                const has_entries = (try subiter.next()) != null;
+                const has_entries = (try subiter.next(io)) != null;
 
                 if (has_entries) {
                     // Recurse
-                    try walkDirectory(allocator, subdir, full_path, lines);
+                    try walkDirectory(io, allocator, subdir, full_path, lines);
                 } else {
                     // Empty directory
                     const line = try std.fmt.allocPrint(allocator, "{s}/", .{full_path});
@@ -333,14 +325,6 @@ fn errExit(comptime fmt: []const u8, args: anytype) noreturn {
     std.process.exit(0xff);
 }
 
-fn stderrFile() std.fs.File {
-    return if (zig15) std.fs.File.stderr() else std.io.getStdErr();
-}
-
-const zig15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
-const std15 = if (zig15) std else @import("std15");
-const File15 = if (zig15) std.fs.File else std15.fs.File15;
-
 const std = @import("std");
-const ArrayList = if (zig15) std.ArrayList else std.ArrayListUnmanaged;
+const ArrayList = std.ArrayList;
 const LockFile = @import("LockFile.zig");

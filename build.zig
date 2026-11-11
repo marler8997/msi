@@ -51,6 +51,16 @@ pub fn build(b: *std.Build) void {
 
     const install_generate_verify = b.addInstallArtifact(generate_verify_exe, .{});
 
+    const msitest_exe = b.addExecutable(.{
+        .name = "msitest",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/msitest.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const install_msitest = b.addInstallArtifact(msitest_exe, .{});
+
     const cache_path = b.path("cache");
 
     const test_step = b.step("test", "");
@@ -90,19 +100,10 @@ pub fn build(b: *std.Build) void {
         gen_verify.addDirectoryArg2(b.path("test/verify"), .{ .suffix = b.fmt("/{s}", .{test_case}) });
         const verify_file = gen_verify.addOutputFileArg(test_case);
 
-        const exe = b.addExecutable(.{
-            .name = "msitest",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("test/msitest.zig"),
-                .target = target,
-                .optimize = optimize,
-            }),
-        });
-        const install = b.addInstallArtifact(exe, .{});
-        const run = b.addRunArtifact(exe);
+        const run = b.addRunArtifact(msitest_exe);
         run.step.name = b.fmt("msitest {s}", .{test_case});
         run.expectExitCode(0);
-        run.step.dependOn(&install.step);
+        run.step.dependOn(&install_msitest.step);
         run.step.dependOn(&install_msi.step);
         run.addArtifactArg(msi_exe);
         run.addDirectoryArg2(cache_path, .{});
